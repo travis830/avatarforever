@@ -17,6 +17,9 @@ Client to server
                                The model works on a grid 32 times coarser than the picture, so
                                a face 135 pixels tall is four cells; closer in, it gets more.
                                focus_x / focus_y: where the face is, as shares of the picture.
+                               anchor "still": every window looks back at the given picture itself
+                               rather than at the first second as it was generated.
+                               subject: a description of who and where, put in front of the prompts.
     binary                     speech, 16-bit mono PCM at ``sr``; send a whole utterance at once
     {"type": "clock", "played": 12.3}    seconds the page has played, a few times a second
     {"type": "flush"}          drop speech that has not been drawn yet
@@ -164,18 +167,27 @@ class Stream:
         self.lead = float(start.get("lead") or 1.5)
         steps = int(start.get("steps") or 4)
         motion = "original" if start.get("motion") == "original" else "calm"
+        cache = start.get("cache", True)
+        cache = cache if cache in ("all", "last_full", "off") else ("all" if cache else "off")
         crf = max(14, min(32, int(start.get("crf") or 21)))
         self.options = {
-            "steps": steps, "cache": bool(start.get("cache", True)), "seed": int(start.get("seed") or 42),
+            "steps": steps, "cache": cache, "seed": int(start.get("seed") or 42),
             "size": f"{self.width}x{self.height}", "motion": motion, "crf": crf,
         }
         # Which prompt a chunk is drawn with depends on whether it carries speech.
+        anchor = "still" if start.get("anchor") == "still" else "generated"
+        subject = " ".join(str(start.get("subject") or "").split())[:900]
+        self.options["anchor"] = anchor
+        self.options["subject"] = bool(subject)
         if start.get("prompt"):
             self.speak_prompt = self.idle_prompt = str(start["prompt"])
         elif motion == "original":
             self.speak_prompt = self.idle_prompt = DEFAULT_PROMPT
         else:
             self.speak_prompt, self.idle_prompt = CALM_SPEAKING_PROMPT, IDLE_PROMPT
+        if subject:
+            self.speak_prompt = f"{subject} {self.speak_prompt}"
+            self.idle_prompt = f"{subject} {self.idle_prompt}"
         engine.context(self.speak_prompt)
         self.current_prompt = self.idle_prompt
         self.image_path: str | None = None
@@ -193,7 +205,7 @@ class Stream:
             engine, image_path=self.image_path, prompt=self.idle_prompt,
             seed=self.options["seed"], height=self.height, width=self.width,
             sigmas=DEFAULT_SIGMAS if steps >= 4 else THREE_STEP_SIGMAS,
-            feature_cache=self.options["cache"], decode_context=2, decode_delay=True,
+            feature_cache=self.options["cache"], decode_context=2, decode_delay=True, anchor=anchor,
         )
         self.encoder = Encoder(self.width, self.height, crf)
         self.speech = np.zeros(0, dtype=np.int16)   # speech waiting to be drawn

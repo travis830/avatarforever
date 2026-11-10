@@ -211,17 +211,22 @@ class Session:
         height: int = 512,
         width: int = 768,
         sigmas: tuple[float, ...] = DEFAULT_SIGMAS,
-        feature_cache: bool = True,
+        feature_cache: bool | str = True,
         decode_context: int = 2,
         decode_delay: bool = True,
         audio_context_seconds: float = 2.0,
+        anchor: str = "generated",
     ) -> None:
         self.e = engine
         self.image_path = image_path
         self.height, self.width = height, width
         self.tokens_per_frame = (height // 32) * (width // 32)
         self.sigmas = torch.tensor(sigmas, device=engine.device, dtype=torch.float32)
-        self.feature_cache = feature_cache
+        # "all": history features from the first step serve every later step (fastest).
+        # "last_full": the same, except the last step looks at the real history again.
+        # "off": every step looks at the real history (slower than real time at four steps).
+        self.feature_cache = {True: "all", False: "off"}.get(feature_cache, feature_cache)
+        self.anchor = anchor
         self.decode_delay = decode_delay
         self.decode_context = max(1 if decode_delay else 0, min(CHUNK_LATENT_FRAMES - 1, decode_context))
         self.audio_context = int(round(audio_context_seconds * AUDIO_LATENTS_PER_SECOND))
@@ -373,9 +378,10 @@ class Session:
             window_frames = 8 * (video_state.latent.shape[1] // self.tokens_per_frame - 1) + 1
         audio_state, audio_current = self._audio_state(audio, window_frames)
 
-        cache = ARFeatureCache() if self.feature_cache else None
+        cache = ARFeatureCache() if self.feature_cache != "off" else None
+        last = len(self.sigmas) - 2
         for step in range(len(self.sigmas) - 1):
-            if cache is None:
+            if cache is None or (self.feature_cache == "last_full" and step == last and step > 0):
                 denoised, _ = self.denoise(video_state, audio_state, self.sigmas, step)
             else:
                 denoised, _ = self.denoise(
@@ -395,6 +401,15 @@ class Session:
 
         if self.index == 0:
             self.first, self.first_audio = tokens, audio
+            if self.anchor == "still" and self.image_path:
+                # The chunk every later window keeps looking back at. As generated, only its first
+                # latent frame is the picture that was given; by its last the model has tilted her head
+                # and redrawn her face. Here all four latent frames are that first one, the way the
+                # paper's own first-frame condition repeats it. Chunk 0 is still generated and shown,
+                # and stays the "previous chunk" for chunk 1: beginning from four frozen frames
+                # instead was tried and was worse (0.53 against the picture after two seconds).
+                per_frame = self.tokens_per_frame
+                self.first = tokens[:, :per_frame].repeat(1, CHUNK_LATENT_FRAMES, 1).contiguous()
         self.previous, self.previous_audio = tokens, audio
         chunk = Chunk(index=self.index, frames=frames, seconds=frames.shape[0] / FPS, timing=timing)
         self.index += 1

@@ -32,6 +32,10 @@ async def main() -> None:
     p.add_argument("--width", type=int, default=768)
     p.add_argument("--height", type=int, default=512)
     p.add_argument("--zoom", type=float, default=1.0)
+    p.add_argument("--anchor", default="generated", choices=("generated", "still"))
+    p.add_argument("--subject", default="")
+    p.add_argument("--prompt", default=None, help="one prompt for speech and silence alike")
+    p.add_argument("--cache", default="all", choices=("all", "last_full", "off"))
     p.add_argument("--act-at", type=float, default=5.0)
     p.add_argument("--act-seconds", type=float, default=6.0)
     p.add_argument("--save", default=None, help="write what came back to this mp4 (video only)")
@@ -46,7 +50,10 @@ async def main() -> None:
 
     decoder = av.CodecContext.create("h264", "r")
     start = {"type": "start", "sr": sr, "steps": args.steps, "motion": args.motion, "crf": args.crf,
-             "width": args.width, "height": args.height, "zoom": args.zoom}
+             "width": args.width, "height": args.height, "zoom": args.zoom,
+             "anchor": args.anchor, "subject": args.subject, "cache": args.cache}
+    if args.prompt:
+        start["prompt"] = args.prompt
     if args.image:
         start["image_b64"] = base64.b64encode(Path(args.image).read_bytes()).decode()
 
