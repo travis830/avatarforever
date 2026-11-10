@@ -187,6 +187,15 @@ def _resample_audio(
         container.mux(packet)
 
 
+def _stream_rate(fps: int | float) -> Fraction:
+    """Frame rate as an exact fraction.
+
+    ``int(fps)`` turned 29.97 into 29: the frames then play slower than the audio they were
+    generated for, and the two drift apart over the length of the file.
+    """
+    return Fraction(fps).limit_denominator(1001)
+
+
 def encode_video(
     video: torch.Tensor | Iterator[torch.Tensor],
     fps: int | float,
@@ -218,7 +227,7 @@ def encode_video(
 
     container = av.open(output_path, mode="w")
     try:
-        stream = container.add_stream("libx264", rate=int(fps), options=stream_options)
+        stream = container.add_stream("libx264", rate=_stream_rate(fps), options=stream_options)
         stream.width = width
         stream.height = height
         stream.pix_fmt = "yuv420p"
