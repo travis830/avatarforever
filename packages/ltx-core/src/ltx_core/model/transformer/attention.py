@@ -45,13 +45,16 @@ class PytorchAttention(AttentionCallable):
         out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
         return out
 
-from ltx_core.model.sparse_attn.kernel import _attention
-from ltx_core.model.sparse_attn.utils import get_block_map
-
 class SparseAttention(AttentionCallable):
     def __call__(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
+        # Imported here, not at module level: the kernels need triton, which is not a declared
+        # dependency and only ships with the Linux CUDA builds of torch. Importing it eagerly made
+        # every other attention backend unusable wherever triton is missing.
+        from ltx_core.model.sparse_attn.kernel import _attention  # noqa: PLC0415
+        from ltx_core.model.sparse_attn.utils import get_block_map  # noqa: PLC0415
+
         b, _, dim_head = q.shape
         dim_head //= heads
         q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
