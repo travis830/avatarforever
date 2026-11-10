@@ -26,6 +26,10 @@ async def main() -> None:
     p.add_argument("--seconds", type=float, default=14.0)
     p.add_argument("--say-at", type=float, default=3.0, help="send the speech this long after the stream starts")
     p.add_argument("--steps", type=int, default=4)
+    p.add_argument("--act", default=None, help="an action sentence to send")
+    p.add_argument("--act-at", type=float, default=5.0)
+    p.add_argument("--act-seconds", type=float, default=6.0)
+    p.add_argument("--save", default=None, help="write what came back to this mp4 (video only)")
     args = p.parse_args()
 
     with wavelib.open(args.audio, "rb") as w:
@@ -45,6 +49,8 @@ async def main() -> None:
         await ws.send(json.dumps(start))
         print("ready:", json.loads(await ws.recv()))
         said = False
+        acted = args.act is None
+        pictures = []
         decoded = keys = 0
         stream_s = 0.0
         speech_first = None
@@ -53,6 +59,10 @@ async def main() -> None:
                 await ws.send(pcm.tobytes())
                 said, said_at = True, time.time()
                 print(f"  sent {pcm.size / sr:.2f}s of speech at wall {said_at - t0:.2f}s")
+            if not acted and time.time() - t0 >= args.act_at:
+                await ws.send(json.dumps({"type": "action", "text": args.act, "seconds": args.act_seconds}))
+                acted = True
+                print(f"  sent the action at wall {time.time() - t0:.2f}s")
             try:
                 message = await asyncio.wait_for(ws.recv(), timeout=0.1)
             except asyncio.TimeoutError:
@@ -67,7 +77,10 @@ async def main() -> None:
                 packet = av.Packet(message[at : at + size])
                 at += size
                 keys += key
-                decoded += len(decoder.decode(packet))
+                got = decoder.decode(packet)
+                decoded += len(got)
+                if args.save:
+                    pictures.extend(f.to_ndarray(format="rgb24") for f in got)
             audio = np.frombuffer(message[at:], dtype=np.int16)
             assert audio.size == header["samples"], (audio.size, header["samples"])
             wall = time.time() - t0
@@ -76,12 +89,23 @@ async def main() -> None:
                 print(f"  first chunk carrying speech arrived {wall - (said_at - t0):.2f}s after the speech was sent")
             stream_s = header["t"] + header["frames"] / header["fps"]
             print(
-                f"chunk {header['index']:2d} t={header['t']:6.2f}s frames={header['frames']} speech={int(header['speech'])} "
+                f"chunk {header['index']:2d} t={header['t']:6.2f}s frames={header['frames']} speech={int(header['speech'])} acting={int(header.get('acting', False))} "
                 f"bytes video={sum(s for s, _ in header['packets'])} audio_rms={int(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))} "
                 f"timing={header['timing']} ahead={header['ahead']} | wall {wall:.2f}s, stream ahead of wall {stream_s - wall:+.2f}s"
             )
         await ws.send(json.dumps({"type": "end"}))
     print(f"decoded {decoded} frames, {keys} keyframes, {stream_s:.2f}s of stream in {time.time() - t0:.2f}s of wall time")
+    if args.save and pictures:
+        out = av.open(args.save, mode="w")
+        stream = out.add_stream("libx264", rate=25, options={"crf": "18", "preset": "veryfast"})
+        stream.width, stream.height, stream.pix_fmt = pictures[0].shape[1], pictures[0].shape[0], "yuv420p"
+        for array in pictures:
+            for packet in stream.encode(av.VideoFrame.from_ndarray(array, format="rgb24")):
+                out.mux(packet)
+        for packet in stream.encode():
+            out.mux(packet)
+        out.close()
+        print(f"saved {args.save}: {len(pictures)} frames")
 
 
 if __name__ == "__main__":

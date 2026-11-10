@@ -13,12 +13,16 @@ Client to server
     binary                     speech, 16-bit mono PCM at ``sr``; send a whole utterance at once
     {"type": "clock", "played": 12.3}    seconds the page has played, a few times a second
     {"type": "flush"}          drop speech that has not been drawn yet
+    {"type": "action", "text": "She picks up the camera ...", "seconds": 5}
+                               draw the next ``seconds`` with this sentence in front of the prompt,
+                               then go back. The sentence is used as it is: write it in English.
     {"type": "end"}
 
 Server to client
     {"type": "ready", "fps": 25, "width": 768, "height": 512, "codec": "avc1.64001f", "sr": 24000}
     binary chunk               4-byte big-endian header length, a JSON header, then the H.264
                                packets (Annex B) and the 16-bit PCM that goes with those frames
+    {"type": "action", "state": "ready", "text": "...", "chunks": 4, "encode_ms": 180}
     {"type": "error", "message": "..."}
 
 Between utterances the stream keeps going on silence, a little ahead of what the page has played,
@@ -65,7 +69,7 @@ async def load() -> None:
     state["loading"] = True
 
     def build() -> Engine:
-        return Engine(CHECKPOINT, GEMMA_ROOT)
+        return Engine(CHECKPOINT, GEMMA_ROOT, live_prompts=os.environ.get("AVATAR_LIVE_PROMPTS", "1") != "0")
 
     state["engine"] = await asyncio.to_thread(build)
     state["loading"] = False
@@ -82,6 +86,7 @@ async def health() -> dict:
         "streaming": state["stream"] is not None,
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "memory_gb": round(torch.cuda.memory_allocated() / 2**30, 1) if torch.cuda.is_available() else None,
+        "live_prompts": engine is not None and engine.text_encoder is not None,
         "last": state["last"],
     }
 
@@ -153,6 +158,9 @@ class Stream:
         self.chunks = 0
         self.busy_ms: list[float] = []
         self.outbox: asyncio.Queue = asyncio.Queue()
+        self.out = asyncio.Lock()            # chunks and notes share the connection: one at a time
+        self.base_prompt = start.get("prompt") or DEFAULT_PROMPT
+        self.action: dict | None = None      # {"prompt", "chunks", "on"}
         self.sender: asyncio.Task | None = None
 
     # what the page has played by now, assuming it kept playing since its last report
@@ -166,6 +174,39 @@ class Stream:
 
     def flush(self) -> None:
         self.speech = np.zeros(0, dtype=np.int16)
+
+    async def act(self, text: str, seconds: float) -> None:
+        """Put an action sentence in front of the prompt for the next ``seconds`` of video."""
+        text = " ".join(text.split())[:400]
+        if not text:
+            return
+        started = time.perf_counter()
+        prompt = f"{text} {self.base_prompt}"
+        await asyncio.to_thread(self.engine.context, prompt)    # encode now, so the switch itself costs nothing
+        chunks = max(1, round(max(1.0, min(30.0, seconds)) / 1.28))
+        self.action = {"prompt": prompt, "chunks": chunks, "on": False}
+        self.wake.set()
+        async with self.out:
+            with suppress(Exception):
+                await self.ws.send_json({
+                    "type": "action", "state": "ready", "text": text, "chunks": chunks,
+                    "encode_ms": round((time.perf_counter() - started) * 1000),
+                })
+
+    def _prompt_for_next(self) -> bool:
+        """Switch the session to the action prompt or back, as the next chunk needs. True while acting."""
+        action = self.action
+        if action is None:
+            return False
+        if action["chunks"] > 0:
+            if not action["on"]:
+                self.session.set_prompt(action["prompt"])
+                action["on"] = True
+            action["chunks"] -= 1
+            return True
+        self.session.set_prompt(None)
+        self.action = None
+        return False
 
     def _take(self, seconds: float) -> tuple[np.ndarray, bool]:
         """The next ``seconds`` of audio: waiting speech first, silence for whatever is missing."""
@@ -209,7 +250,8 @@ class Stream:
     async def _loop(self) -> None:
         while not self.closed:
             ahead = self.emitted - self.playhead()
-            waiting = self.speech.size > 0
+            # An action that has not started yet is drawn at once, like speech.
+            waiting = self.speech.size > 0 or (self.action is not None and not self.action["on"])
             # Speech is drawn at once; silence only to stay ``lead`` seconds ahead of the page.
             if ahead > MAX_AHEAD_S or (not waiting and ahead > self.lead):
                 self.wake.clear()
@@ -220,6 +262,7 @@ class Stream:
             piece, spoke = self._take(seconds)
             started = time.perf_counter()
             async with gpu:
+                acting = await asyncio.to_thread(self._prompt_for_next)
                 chunk = await asyncio.to_thread(self.session.next, self._for_model(piece))
             drawn_ms = (time.perf_counter() - started) * 1000.0
             at = self.emitted
@@ -228,11 +271,11 @@ class Stream:
             self.busy_ms.append(drawn_ms)
             # Encoding and sending happen beside the next chunk's drawing: the card is free again
             # the moment the frames exist. The queue keeps chunks in order.
-            await self.outbox.put((chunk, piece, spoke, at, ahead, drawn_ms))
+            await self.outbox.put((chunk, piece, spoke, at, ahead, drawn_ms, acting))
 
     async def _send(self) -> None:
         while True:
-            chunk, piece, spoke, at, ahead, drawn_ms = await self.outbox.get()
+            chunk, piece, spoke, at, ahead, drawn_ms, acting = await self.outbox.get()
             started = time.perf_counter()
             packets = await asyncio.to_thread(self.encoder.encode, chunk.frames.numpy())
             encode_ms = (time.perf_counter() - started) * 1000.0
@@ -243,7 +286,7 @@ class Stream:
                 "type": "chunk", "index": chunk.index, "t": round(at, 4),
                 "frames": int(chunk.frames.shape[0]), "fps": FPS,
                 "packets": [[len(data), int(key)] for data, key in packets],
-                "sr": self.sr, "samples": int(audio.size), "speech": spoke,
+                "sr": self.sr, "samples": int(audio.size), "speech": spoke, "acting": acting,
                 "timing": {
                     "audio": round(chunk.timing.audio_ms), "denoise": round(chunk.timing.denoise_ms),
                     "decode": round(chunk.timing.decode_ms), "encode": round(encode_ms), "total": round(drawn_ms),
@@ -254,7 +297,8 @@ class Stream:
             raw = json.dumps(header).encode()
             body = struct.pack(">I", len(raw)) + raw + b"".join(data for data, _ in packets) + audio.tobytes()
             try:
-                await self.ws.send_bytes(body)
+                async with self.out:
+                    await self.ws.send_bytes(body)
             except Exception:  # noqa: BLE001  the page has gone
                 self.closed = True
                 return
@@ -312,6 +356,8 @@ async def stream(ws: WebSocket) -> None:
                     current.played, current.played_at = float(data.get("played") or 0.0), time.time()
                 elif kind == "flush":
                     current.flush()
+                elif kind == "action":
+                    asyncio.create_task(current.act(str(data.get("text") or ""), float(data.get("seconds") or 5.0)))
                 elif kind == "end":
                     break
     except WebSocketDisconnect:

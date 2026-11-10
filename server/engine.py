@@ -88,7 +88,9 @@ class Chunk:
 class Engine:
     """The loaded models. One Engine serves one Session at a time."""
 
-    def __init__(self, checkpoint: str, gemma_root: str, *, cache_dir: str | None = None) -> None:
+    def __init__(
+        self, checkpoint: str, gemma_root: str, *, cache_dir: str | None = None, live_prompts: bool = True
+    ) -> None:
         started = time.time()
         self.pipeline = ARA2VidDistilledPipeline(
             distilled_checkpoint_path=checkpoint, gemma_root=gemma_root, spatial_upsampler_path=None, loras=()
@@ -101,6 +103,7 @@ class Engine:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._contexts: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         self._positions: dict[tuple[int, int, int], torch.Tensor] = {}
+        self._default_key = hashlib.sha256(DEFAULT_PROMPT.encode()).hexdigest()[:24]
 
         # The text encoder is 24 GB and only needed to turn a prompt into embeddings. Do that first,
         # keep the embeddings on disk, and it never has to share the card with the transformer.
@@ -117,7 +120,15 @@ class Engine:
             n_fft=self.audio_encoder.n_fft,
         ).to(device=self.device)
         self.stepper = EulerDiffusionStep()
-        logger.info("models loaded in %.1fs", time.time() - started)
+        # With the text encoder kept on the card (about 24 GB more), a new prompt costs a fraction of a
+        # second instead of ten: that is what lets an action be asked for in the middle of a stream.
+        self.text_encoder = None
+        self.embeddings_processor = None
+        if live_prompts:
+            with torch.inference_mode():
+                self.text_encoder = self.ledger.text_encoder()
+                self.embeddings_processor = self.ledger.gemma_embeddings_processor()
+        logger.info("models loaded in %.1fs (live prompts: %s)", time.time() - started, live_prompts)
 
     def context(self, prompt: str) -> tuple[torch.Tensor, torch.Tensor]:
         """Text embeddings for ``prompt``: from memory, from disk, or by loading the text encoder once."""
@@ -128,6 +139,14 @@ class Engine:
         if path.exists():
             saved = torch.load(path, map_location=self.device)
             pair = (saved["video"], saved["audio"])
+        elif getattr(self, "text_encoder", None) is not None:
+            with torch.inference_mode():
+                hidden_states, attention_mask = self.text_encoder.encode(prompt)
+                processed = self.embeddings_processor.process_hidden_states(hidden_states, attention_mask)
+            pair = (processed.video_encoding.detach(), processed.audio_encoding.detach())
+            if len(self._contexts) > 64:  # prompts asked for in passing are not kept for ever
+                for old in [k for k in self._contexts if k != self._default_key][:16]:
+                    self._contexts.pop(old, None)
         else:
             started = time.time()
             with torch.inference_mode():
@@ -184,10 +203,8 @@ class Session:
         self.audio_context = int(round(audio_context_seconds * AUDIO_LATENTS_PER_SECOND))
         self.generator = torch.Generator(device=engine.device).manual_seed(seed)
         self.noiser = GaussianNoiser(generator=self.generator)
-        video_context, audio_context = engine.context(prompt)
-        self.denoise = simple_denoising_func(
-            video_context=video_context, audio_context=audio_context, transformer=engine.transformer
-        )
+        self.prompt = prompt
+        self.set_prompt(None)
         self.index = 0
         self.first: torch.Tensor | None = None       # tokens of chunk 0
         self.previous: torch.Tensor | None = None    # tokens of the chunk before this one
@@ -195,6 +212,13 @@ class Session:
         self.previous_audio: torch.Tensor | None = None
         self.wave = torch.zeros(0, dtype=torch.float32)  # every sample heard so far, 16 kHz mono
         self.wave_consumed = 0                            # samples of ``wave`` already turned into chunks
+
+    def set_prompt(self, prompt: str | None) -> None:
+        """Draw the chunks from here on with ``prompt``; None goes back to the one the session began with."""
+        video_context, audio_context = self.e.context(prompt or self.prompt)
+        self.denoise = simple_denoising_func(
+            video_context=video_context, audio_context=audio_context, transformer=self.e.transformer
+        )
 
     # ----- audio -----
 
