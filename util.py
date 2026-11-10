@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import av
 import torch
 
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
@@ -15,6 +17,8 @@ from ltx_pipelines.utils.media_io import load_image_conditioning
 if TYPE_CHECKING:
     from ltx_core.model.video_vae import VideoEncoder
     from ltx_pipelines import ARA2VidDistilledPipeline
+
+logger = logging.getLogger(__name__)
 
 
 def optional_int(value: str) -> int | None:
@@ -30,6 +34,56 @@ def valid_num_frames(value: str) -> int:
             f"num_frames must be positive and follow 8n+1 (for example 161, 2001, or 8001), got {frames}."
         )
     return frames
+
+
+def audio_duration_seconds(audio_path: Path) -> float | None:
+    """Duration of the first audio stream in ``audio_path``, or None when the file does not say."""
+    container = av.open(str(audio_path))
+    try:
+        stream = next((s for s in container.streams if s.type == "audio"), None)
+        if stream is None:
+            return None
+        if stream.duration is not None and stream.time_base is not None:
+            return float(stream.duration * stream.time_base)
+        if container.duration is not None:
+            return container.duration / av.time_base
+        return None
+    finally:
+        container.close()
+
+
+def frames_for_duration(duration: float, frame_rate: float) -> int:
+    """Largest frame count of the form 8n+1 that fits inside ``duration`` seconds (at least 9)."""
+    frames = int(duration * frame_rate + 1e-6)
+    return max(9, ((frames - 1) // 8) * 8 + 1)
+
+
+def resolve_num_frames(requested: int | None, audio_path: Path, frame_rate: float) -> int:
+    """Pick the output frame count: the caller's value, or as much as the audio covers.
+
+    A fixed default used to generate 80 seconds whatever the audio length. Audio shorter than
+    the video is padded with zero latents, which is not silence, so the tail was driven by noise
+    and saved without sound.
+    """
+    duration = audio_duration_seconds(audio_path)
+    if requested is None:
+        if duration is None:
+            raise ValueError(f"Could not read the audio duration from {audio_path}; pass --num-frames explicitly.")
+        frames = frames_for_duration(duration, frame_rate)
+        logger.info("Audio is %.2fs long; generating %d frames (%.2fs).", duration, frames, frames / frame_rate)
+        return frames
+
+    video_seconds = requested / frame_rate
+    if duration is not None and video_seconds > duration + 1.0 / frame_rate:
+        logger.warning(
+            "--num-frames %d asks for %.2fs of video but the audio is only %.2fs long. The last %.2fs "
+            "is generated from zero-padded audio latents (not silence) and is saved without sound.",
+            requested,
+            video_seconds,
+            duration,
+            video_seconds - duration,
+        )
+    return requested
 
 
 def build_loras(lora_path: Path | None, strength: float) -> list[LoraPathStrengthAndSDOps]:

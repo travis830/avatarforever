@@ -124,8 +124,9 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
             else:
                 continue
             output_sd[name] = tensor
-            logger.info(
-                "Initialized missing %s with %s init for backward-compatible checkpoint loading.",
+            logger.warning(
+                "%s is not in the checkpoint; filled it with %s init. A zero-filled channel-condition "
+                "projection makes the first-frame channel condition a no-op.",
                 name,
                 init_description,
             )

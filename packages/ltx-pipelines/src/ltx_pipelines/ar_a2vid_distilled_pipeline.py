@@ -59,6 +59,7 @@ class ARA2VidDistilledPipeline(A2VidDistilledPipeline):
         ar_first_frame_prefix_condition: bool = False,
         ar_first_frame_condition_position: Literal["prepend", "append"] = "prepend",
         ar_rope_max_temporal_index: int | None = None,
+        ar_audio_alignment: Literal["time", "proportional"] = "time",
         audio_start_time: float = 0.0,
         audio_max_duration: float | None = None,
         tiling_config: TilingConfig | None = None,
@@ -116,6 +117,7 @@ class ARA2VidDistilledPipeline(A2VidDistilledPipeline):
             ar_first_frame_prefix_condition=ar_first_frame_prefix_condition,
             ar_first_frame_condition_position=ar_first_frame_condition_position,
             ar_rope_max_temporal_index=ar_rope_max_temporal_index,
+            ar_audio_alignment=ar_audio_alignment,
         )
 
 

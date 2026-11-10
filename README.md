@@ -112,7 +112,7 @@ uv run python inference.py \
   --output-path outputs/result.mp4
 ```
 
-The default configuration uses one-stage distilled inference at 768 × 512 and 25 FPS, generates 2001 frames, uses AR chunk size 4 with one history chunk, derives first-frame channel conditioning from the first generated chunk, and saves H.264 video at CRF 12. Frame counts must be positive and follow `8n+1`, such as 161, 2001, or 8001.
+The default configuration uses one-stage distilled inference at 768 × 512 and 25 FPS, generates as many frames as the audio covers (override with `--num-frames`), uses AR chunk size 4 with one history chunk, derives first-frame channel conditioning from the first generated chunk, and saves H.264 video at CRF 12. Frame counts must be positive and follow `8n+1`, such as 161, 2001, or 8001.
 
 Use `python inference.py --help` to see all controls, including video length, autoregressive history, first-frame conditioning, VAE tiling, x264 CRF, and encoding preset.
 

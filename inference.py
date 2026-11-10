@@ -15,6 +15,7 @@ from util import (
     build_tiling_config,
     encode_first_frame_channel_condition,
     optional_int,
+    resolve_num_frames,
     resolve_output_path,
     valid_num_frames,
 )
@@ -53,8 +54,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     generation.add_argument(
         "--num-frames",
         type=valid_num_frames,
-        default=2001,
-        help="Output frame count. Must follow 8n+1; default: %(default)s.",
+        default=None,
+        help="Output frame count. Must follow 8n+1. Default: as many frames as the audio covers.",
     )
     generation.add_argument("--frame-rate", type=float, default=25.0)
     generation.add_argument(
@@ -71,6 +72,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     autoregressive.add_argument("--ar-sink-first-chunk", action=argparse.BooleanOptionalAction, default=True)
     autoregressive.add_argument("--ar-relative-positions", action=argparse.BooleanOptionalAction, default=True)
     autoregressive.add_argument("--ar-history-feature-cache", action=argparse.BooleanOptionalAction, default=False)
+    autoregressive.add_argument(
+        "--ar-audio-alignment",
+        choices=("time", "proportional"),
+        default="time",
+        help=(
+            "How the audio is split across AR chunks. 'time' cuts where each chunk's video frames end on "
+            "the clock. 'proportional' is the original equal-share rule, which lets lip sync slip by about "
+            "0.23s over a run; kept for comparison."
+        ),
+    )
     autoregressive.add_argument(
         "--first-frame-prefix-condition",
         action=argparse.BooleanOptionalAction,
@@ -129,11 +140,13 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+    args.num_frames = resolve_num_frames(args.num_frames, args.audio_path, args.frame_rate)
 
     pipeline = ARA2VidDistilledPipeline(
         distilled_checkpoint_path=str(args.distilled_checkpoint_path),
         spatial_upsampler_path=None,
         gemma_root=str(args.gemma_root),
+        loras=(),
     )
     images = build_first_frame_images(
         args.first_frame_condition_image_path,
@@ -177,6 +190,7 @@ def main() -> None:
             ar_sink_first_chunk=args.ar_sink_first_chunk,
             ar_relative_positions=args.ar_relative_positions,
             ar_history_feature_cache=args.ar_history_feature_cache,
+            ar_audio_alignment=args.ar_audio_alignment,
             ar_first_frame_prefix_condition=args.first_frame_prefix_condition,
             ar_first_frame_condition_position=args.first_frame_condition_position,
             first_frame_channel_condition_latent=first_frame_channel_condition_latent,

@@ -30,15 +30,64 @@ def build_progressive_chunk_ranges(total_steps: int, chunk_size: int) -> list[tu
     return chunk_ranges
 
 
+AudioAlignment = Literal["time", "proportional"]
+AUDIO_ALIGNMENTS: tuple[str, ...] = ("time", "proportional")
+
+
+def _pixel_frames_through(latent_frames: int, temporal_scale: int) -> int:
+    """Pixel frames covered by the first ``latent_frames`` video latent frames.
+
+    The video VAE is causal in time: the first latent frame stands for a single pixel frame and
+    every later one for ``temporal_scale`` frames.
+    """
+    return 0 if latent_frames <= 0 else (latent_frames - 1) * temporal_scale + 1
+
+
+def audio_steps_through(
+    latent_frames: int,
+    *,
+    total_video_frames: int,
+    total_audio_steps: int,
+    alignment: AudioAlignment = "time",
+    temporal_scale: int = 8,
+) -> int:
+    """Audio latent steps that belong to the first ``latent_frames`` video latent frames.
+
+    ``"time"`` puts the boundary where those video frames end on the clock.
+
+    ``"proportional"`` is the original rule: an equal share of the audio per latent frame. It
+    ignores that the first latent frame is one pixel frame and the rest are ``temporal_scale``,
+    so a boundary sits up to ``temporal_scale - 1`` pixel frames late at the start of a run and
+    drifts to zero at the end. Because each chunk is denoised inside a window whose positions
+    are rebuilt from zero, the video then lines up with audio that is progressively earlier
+    than its own, by about 0.23s at the end at 25 fps, and which audio a chunk receives depends
+    on the total length of the run.
+    """
+    if alignment not in AUDIO_ALIGNMENTS:
+        raise ValueError(f"alignment must be one of {AUDIO_ALIGNMENTS}, got {alignment!r}.")
+    if alignment == "proportional":
+        return math.ceil(latent_frames * total_audio_steps / total_video_frames)
+    total_pixel_frames = _pixel_frames_through(total_video_frames, temporal_scale)
+    covered = _pixel_frames_through(latent_frames, temporal_scale)
+    return math.floor(covered * total_audio_steps / total_pixel_frames + 0.5)
+
+
 def build_aligned_audio_chunk_ranges(
     video_chunk_ranges: list[tuple[int, int]],
     *,
     total_video_frames: int,
     total_audio_steps: int,
+    alignment: AudioAlignment = "time",
+    temporal_scale: int = 8,
 ) -> list[tuple[int, int]]:
-    """Build contiguous audio chunk ranges aligned with video chunk progress."""
+    """Build contiguous audio chunk ranges aligned with video chunk progress.
+
+    See :func:`audio_steps_through` for the two alignment rules.
+    """
     if total_video_frames <= 0:
         raise ValueError(f"total_video_frames must be positive, got {total_video_frames}")
+    if alignment not in AUDIO_ALIGNMENTS:
+        raise ValueError(f"alignment must be one of {AUDIO_ALIGNMENTS}, got {alignment!r}.")
     if total_audio_steps <= 0:
         return [(0, 0) for _ in video_chunk_ranges]
 
@@ -48,7 +97,13 @@ def build_aligned_audio_chunk_ranges(
         if chunk_idx == len(video_chunk_ranges) - 1:
             audio_end = total_audio_steps
         else:
-            audio_end = math.ceil(frame_end * total_audio_steps / total_video_frames)
+            audio_end = audio_steps_through(
+                frame_end,
+                total_video_frames=total_video_frames,
+                total_audio_steps=total_audio_steps,
+                alignment=alignment,
+                temporal_scale=temporal_scale,
+            )
             if audio_end <= audio_start:
                 audio_end = min(total_audio_steps, audio_start + 1)
         audio_ranges.append((audio_start, min(total_audio_steps, audio_end)))
@@ -419,8 +474,12 @@ def autoregressive_euler_denoising_loop(
     max_generate_video_latent_frames: int | None = None,
     start_chunk_idx: int = 0,
     end_chunk_idx: int | None = None,
+    audio_alignment: AudioAlignment = "time",
+    video_temporal_scale: int = 8,
 ) -> tuple[LatentState, LatentState]:
     """Run chunk-wise prefix-growing denoising for joint video-audio generation."""
+    if audio_alignment not in AUDIO_ALIGNMENTS:
+        raise ValueError(f"audio_alignment must be one of {AUDIO_ALIGNMENTS}, got {audio_alignment!r}.")
     if first_frame_condition_position not in ("prepend", "append"):
         raise ValueError(
             "first_frame_condition_position must be 'prepend' or 'append', "
@@ -458,12 +517,20 @@ def autoregressive_euler_denoising_loop(
     if generate_video_latent_frames < total_video_latent_frames:
         audio_steps_for_generation = max(
             1,
-            math.ceil(generate_video_latent_frames * audio_state.latent.shape[1] / total_video_latent_frames),
+            audio_steps_through(
+                generate_video_latent_frames,
+                total_video_frames=total_video_latent_frames,
+                total_audio_steps=audio_state.latent.shape[1],
+                alignment=audio_alignment,
+                temporal_scale=video_temporal_scale,
+            ),
         )
     audio_chunk_ranges = build_aligned_audio_chunk_ranges(
         video_chunk_ranges,
         total_video_frames=generate_video_latent_frames,
         total_audio_steps=audio_steps_for_generation,
+        alignment=audio_alignment,
+        temporal_scale=video_temporal_scale,
     )
     num_chunks = len(video_chunk_ranges)
     if start_chunk_idx < 0 or start_chunk_idx >= num_chunks:

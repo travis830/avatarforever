@@ -61,7 +61,7 @@ from ltx_pipelines.utils.helpers import (
     modality_from_latent_state,
     simple_denoising_func,
 )
-from ltx_pipelines.utils.autoregressive import autoregressive_euler_denoising_loop
+from ltx_pipelines.utils.autoregressive import AudioAlignment, autoregressive_euler_denoising_loop
 from ltx_pipelines.utils.media_io import (
     decode_audio_from_file,
     encode_video,
@@ -133,6 +133,25 @@ def _resolve_sigmas(
     if torch.any(sigmas[:-1] < sigmas[1:]):
         raise ValueError(f"{name} must be monotonically non-increasing.")
     return sigmas
+
+
+def _warn_if_channel_condition_is_inert(transformer: torch.nn.Module) -> None:
+    """Say so when the first-frame channel condition cannot change the output.
+
+    The pathway adds ``proj(condition) * gate`` to the video tokens. With an all-zero projection
+    it adds zero whatever the gate holds, so turning the condition on does nothing. Weights that
+    were zero-filled because the checkpoint lacked them, or that were saved before the pathway
+    was trained, look exactly like this.
+    """
+    velocity_model = getattr(transformer, "velocity_model", transformer)
+    projection = getattr(velocity_model, "video_channel_condition_proj", None)
+    if projection is None:
+        return
+    if int(torch.count_nonzero(projection.weight)) == 0:
+        logger.warning(
+            "video_channel_condition_proj.weight is all zeros in this checkpoint: the first-frame channel "
+            "condition adds nothing to the video tokens, so it has no effect on this run."
+        )
 
 
 def _build_stg_perturbation_config(
@@ -240,7 +259,7 @@ class A2VidDistilledPipeline:
         distilled_checkpoint_path: str,
         gemma_root: str,
         spatial_upsampler_path: str | None,
-        loras: list[LoraPathStrengthAndSDOps],
+        loras: list[LoraPathStrengthAndSDOps] | tuple[LoraPathStrengthAndSDOps, ...] = (),
         device: torch.device = device,
         quantization: QuantizationPolicy | None = None,
     ):
@@ -595,6 +614,7 @@ class A2VidDistilledPipeline:
         ar_first_frame_condition_position: Literal["prepend", "append"],
         ar_rope_max_temporal_index: int | None,
         dtype: torch.dtype,
+        ar_audio_alignment: AudioAlignment = "time",
         initial_video_latent: torch.Tensor | None = None,
         initial_audio_latent: torch.Tensor | None = None,
         video_channel_condition: torch.Tensor | None = None,
@@ -646,6 +666,8 @@ class A2VidDistilledPipeline:
             first_frame_prefix_condition=ar_first_frame_prefix_condition,
             first_frame_condition_position=ar_first_frame_condition_position,
             rope_max_temporal_index=ar_rope_max_temporal_index,
+            audio_alignment=ar_audio_alignment,
+            video_temporal_scale=self.pipeline_components.video_scale_factors.time,
         )
         video_state = video_tools.clear_conditioning(video_state)
         return video_tools.unpatchify(video_state)
@@ -915,6 +937,7 @@ class A2VidDistilledPipeline:
         ar_first_frame_prefix_condition: bool = False,
         ar_first_frame_condition_position: Literal["prepend", "append"] = "prepend",
         ar_rope_max_temporal_index: int | None = None,
+        ar_audio_alignment: AudioAlignment = "time",
         first_frame_channel_condition_latent: torch.Tensor | None = None,
         stage2_first_frame_channel_condition_latent: torch.Tensor | None = None,
         first_frame_channel_condition_init: Literal["zero", "xavier", "kaiming"] = "zero",
@@ -1035,6 +1058,8 @@ class A2VidDistilledPipeline:
             if fast_modules is not None
             else self.model_ledger.transformer(extra_config=transformer_extra_config)
         )
+        if transformer_extra_config is not None:
+            _warn_if_channel_condition_is_inert(transformer)
         stage_1_sigmas = _resolve_sigmas(
             stage1_sigmas,
             DISTILLED_SIGMA_VALUES,
@@ -1120,6 +1145,7 @@ class A2VidDistilledPipeline:
                 ar_first_frame_prefix_condition=ar_first_frame_prefix_condition,
                 ar_first_frame_condition_position=ar_first_frame_condition_position,
                 ar_rope_max_temporal_index=ar_rope_max_temporal_index,
+                ar_audio_alignment=ar_audio_alignment,
                 dtype=dtype,
                 initial_audio_latent=encoded_audio_latent,
                 video_channel_condition=stage1_video_channel_condition,
@@ -1211,6 +1237,7 @@ class A2VidDistilledPipeline:
                     ar_first_frame_prefix_condition=ar_first_frame_prefix_condition,
                     ar_first_frame_condition_position=ar_first_frame_condition_position,
                     ar_rope_max_temporal_index=ar_rope_max_temporal_index,
+                    ar_audio_alignment=ar_audio_alignment,
                     dtype=dtype,
                     initial_video_latent=upscaled_video_latent,
                     initial_audio_latent=encoded_audio_latent,
