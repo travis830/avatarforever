@@ -9,7 +9,10 @@ WS   /ws/stream         one stream at a time; a new connection takes over from t
 
 Client to server
     {"type": "start", "image_b64": "...", "sr": 24000, "steps": 4, "cache": true, "seed": 42,
-     "width": 768, "height": 512, "prompt": null, "lead": 1.5}
+     "width": 768, "height": 512, "prompt": null, "lead": 1.5, "motion": "calm", "crf": 21}
+                               motion "calm": a steady-head prompt while she speaks and a listening
+                               prompt in silence. "original": the released prompt for everything.
+                               crf: H.264 quality, lower is sharper and bigger.
     binary                     speech, 16-bit mono PCM at ``sr``; send a whole utterance at once
     {"type": "clock", "played": 12.3}    seconds the page has played, a few times a second
     {"type": "flush"}          drop speech that has not been drawn yet
@@ -48,7 +51,17 @@ import torch
 import torchaudio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-from server.engine import DEFAULT_PROMPT, DEFAULT_SIGMAS, FPS, THREE_STEP_SIGMAS, Engine, Session, chunk_seconds
+from server.engine import (
+    CALM_SPEAKING_PROMPT,
+    DEFAULT_PROMPT,
+    DEFAULT_SIGMAS,
+    FPS,
+    IDLE_PROMPT,
+    THREE_STEP_SIGMAS,
+    Engine,
+    Session,
+    chunk_seconds,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("avatar.server")
@@ -94,14 +107,14 @@ async def health() -> dict:
 class Encoder:
     """H.264, one packet per frame, a keyframe at the start of every chunk."""
 
-    def __init__(self, width: int, height: int) -> None:
+    def __init__(self, width: int, height: int, crf: int = 21) -> None:
         ctx = av.CodecContext.create("libx264", "w")
         ctx.width, ctx.height = width, height
         ctx.pix_fmt = "yuv420p"
         ctx.time_base = Fraction(1, int(FPS))
         ctx.framerate = Fraction(int(FPS), 1)
         ctx.options = {
-            "preset": "veryfast", "tune": "zerolatency", "crf": "26", "profile": "high", "forced-idr": "1",
+            "preset": "veryfast", "tune": "zerolatency", "crf": str(crf), "profile": "high", "forced-idr": "1",
             "x264-params": "keyint=250:min-keyint=1:scenecut=0:bframes=0:repeat-headers=1",
         }
         ctx.open()
@@ -127,12 +140,25 @@ class Stream:
         self.sr = int(start.get("sr") or 24000)
         self.width = int(start.get("width") or 768)
         self.height = int(start.get("height") or 512)
+        if self.width * self.height > 900 * 620 or self.width % 32 or self.height % 32:
+            raise ValueError("width and height must be multiples of 32 and no larger than 896x608 on this card")
         self.lead = float(start.get("lead") or 1.5)
         steps = int(start.get("steps") or 4)
+        motion = "original" if start.get("motion") == "original" else "calm"
+        crf = max(14, min(32, int(start.get("crf") or 21)))
         self.options = {
             "steps": steps, "cache": bool(start.get("cache", True)), "seed": int(start.get("seed") or 42),
-            "size": f"{self.width}x{self.height}",
+            "size": f"{self.width}x{self.height}", "motion": motion, "crf": crf,
         }
+        # Which prompt a chunk is drawn with depends on whether it carries speech.
+        if start.get("prompt"):
+            self.speak_prompt = self.idle_prompt = str(start["prompt"])
+        elif motion == "original":
+            self.speak_prompt = self.idle_prompt = DEFAULT_PROMPT
+        else:
+            self.speak_prompt, self.idle_prompt = CALM_SPEAKING_PROMPT, IDLE_PROMPT
+        engine.context(self.speak_prompt)
+        self.current_prompt = self.idle_prompt
         self.image_path: str | None = None
         if start.get("image_b64"):
             handle = tempfile.NamedTemporaryFile(prefix="avatar-", suffix=".png", delete=False)
@@ -140,12 +166,12 @@ class Stream:
             handle.close()
             self.image_path = handle.name
         self.session = Session(
-            engine, image_path=self.image_path, prompt=start.get("prompt") or DEFAULT_PROMPT,
+            engine, image_path=self.image_path, prompt=self.idle_prompt,
             seed=self.options["seed"], height=self.height, width=self.width,
             sigmas=DEFAULT_SIGMAS if steps >= 4 else THREE_STEP_SIGMAS,
             feature_cache=self.options["cache"], decode_context=2, decode_delay=True,
         )
-        self.encoder = Encoder(self.width, self.height)
+        self.encoder = Encoder(self.width, self.height, crf)
         self.speech = np.zeros(0, dtype=np.int16)   # speech waiting to be drawn
         self.speech_at = 0.0
         self.left = np.zeros(0, dtype=np.int16)     # tail of what was already drawn, for the resampler
@@ -159,8 +185,7 @@ class Stream:
         self.busy_ms: list[float] = []
         self.outbox: asyncio.Queue = asyncio.Queue()
         self.out = asyncio.Lock()            # chunks and notes share the connection: one at a time
-        self.base_prompt = start.get("prompt") or DEFAULT_PROMPT
-        self.action: dict | None = None      # {"prompt", "chunks", "on"}
+        self.action: dict | None = None      # {"text", "chunks", "on"}
         self.sender: asyncio.Task | None = None
 
     # what the page has played by now, assuming it kept playing since its last report
@@ -181,11 +206,13 @@ class Stream:
         if not text:
             return
         started = time.perf_counter()
-        prompt = f"{text} {self.base_prompt}"
-        await asyncio.to_thread(self.engine.context, prompt)    # encode now, so the switch itself costs nothing
+        # Encode now, with either base it may be joined to, so the switch itself costs nothing.
+        for base in {self.speak_prompt, self.idle_prompt}:
+            await asyncio.to_thread(self.engine.context, f"{text} {base}")
         chunks = max(1, round(max(1.0, min(30.0, seconds)) / 1.28))
-        self.action = {"prompt": prompt, "chunks": chunks, "on": False}
+        self.action = {"text": text, "chunks": chunks, "on": False}
         self.wake.set()
+        logger.info("action for %d chunks: %s", chunks, text)
         async with self.out:
             with suppress(Exception):
                 await self.ws.send_json({
@@ -193,20 +220,23 @@ class Stream:
                     "encode_ms": round((time.perf_counter() - started) * 1000),
                 })
 
-    def _prompt_for_next(self) -> bool:
-        """Switch the session to the action prompt or back, as the next chunk needs. True while acting."""
+    def _prompt_for_next(self, spoke: bool) -> bool:
+        """Give the session the prompt the next chunk needs. True while an action is being drawn."""
+        want = self.speak_prompt if spoke else self.idle_prompt
+        acting = False
         action = self.action
-        if action is None:
-            return False
-        if action["chunks"] > 0:
-            if not action["on"]:
-                self.session.set_prompt(action["prompt"])
+        if action is not None:
+            if action["chunks"] > 0:
                 action["on"] = True
-            action["chunks"] -= 1
-            return True
-        self.session.set_prompt(None)
-        self.action = None
-        return False
+                action["chunks"] -= 1
+                acting = True
+                want = f"{action['text']} {want}"
+            else:
+                self.action = None
+        if want != self.current_prompt:
+            self.session.set_prompt(want)
+            self.current_prompt = want
+        return acting
 
     def _take(self, seconds: float) -> tuple[np.ndarray, bool]:
         """The next ``seconds`` of audio: waiting speech first, silence for whatever is missing."""
@@ -262,7 +292,7 @@ class Stream:
             piece, spoke = self._take(seconds)
             started = time.perf_counter()
             async with gpu:
-                acting = await asyncio.to_thread(self._prompt_for_next)
+                acting = await asyncio.to_thread(self._prompt_for_next, spoke)
                 chunk = await asyncio.to_thread(self.session.next, self._for_model(piece))
             drawn_ms = (time.perf_counter() - started) * 1000.0
             at = self.emitted
@@ -308,6 +338,10 @@ class Stream:
         self.wake.set()
         if self.sender is not None:
             self.sender.cancel()
+        # Give back what this stream's sizes left in the allocator: a larger picture leaves the card nearly
+        # full, and with the text encoder loaded there are only a few GB to spare.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         if self.image_path:
             with suppress(OSError):
                 Path(self.image_path).unlink()

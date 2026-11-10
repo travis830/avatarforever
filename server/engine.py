@@ -55,6 +55,30 @@ DEFAULT_PROMPT = (
     "fluid, stable, and naturally driven by the audio."
 )
 
+# The released prompt asks for motion all the time ("subtle head movement ... relaxed upper-body motion ...
+# gestures should respond to the rhythm"). Measured on this checkpoint the head tilts through 27 degrees
+# in nine seconds of speech and 39 degrees in four seconds of silence, swinging back about once a chunk.
+# These two ask for a steady head, and silence gets its own prompt instead of the speaking one.
+_STEADY = (
+    "Maintain strong temporal consistency across all frames. Keep facial appearance, identity, pose, body "
+    "structure, clothing details, lighting, and background stable throughout the video. Avoid sudden motion "
+    "changes, head swaying, rocking, nodding, excessive gestures, unnatural expression shifts, flickering, "
+    "jitter, ghosting, texture instability, temporal artifacts, or deformation. A single continuous shot with "
+    "a fixed camera."
+)
+CALM_SPEAKING_PROMPT = (
+    "She speaks to the viewer with accurate lip synchronization and natural, continuous facial animation. "
+    "Her head stays upright and almost still, facing the viewer, with only very small natural movements. "
+    "Her shoulders and upper body stay steady. Natural blinking and gentle breathing. Her expression follows "
+    "the tone of the speech but stays restrained and realistic.\n\n" + _STEADY
+)
+IDLE_PROMPT = (
+    "She sits still and listens quietly, facing the viewer. Her mouth stays gently closed, with no speaking "
+    "and no mouthing. Her head stays upright and still. Only natural blinking, gentle breathing and very "
+    "small, slow movements. Her hands, shoulders and upper body stay at rest. Her expression is soft and "
+    "attentive.\n\n" + _STEADY
+)
+
 
 def chunk_frames(index: int) -> int:
     """Pixel frames in chunk ``index``."""
