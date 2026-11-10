@@ -31,6 +31,7 @@ async def main() -> None:
     p.add_argument("--crf", type=int, default=21)
     p.add_argument("--width", type=int, default=768)
     p.add_argument("--height", type=int, default=512)
+    p.add_argument("--zoom", type=float, default=1.0)
     p.add_argument("--act-at", type=float, default=5.0)
     p.add_argument("--act-seconds", type=float, default=6.0)
     p.add_argument("--save", default=None, help="write what came back to this mp4 (video only)")
@@ -45,7 +46,7 @@ async def main() -> None:
 
     decoder = av.CodecContext.create("h264", "r")
     start = {"type": "start", "sr": sr, "steps": args.steps, "motion": args.motion, "crf": args.crf,
-             "width": args.width, "height": args.height}
+             "width": args.width, "height": args.height, "zoom": args.zoom}
     if args.image:
         start["image_b64"] = base64.b64encode(Path(args.image).read_bytes()).decode()
 

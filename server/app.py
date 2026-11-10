@@ -13,6 +13,10 @@ Client to server
                                motion "calm": a steady-head prompt while she speaks and a listening
                                prompt in silence. "original": the released prompt for everything.
                                crf: H.264 quality, lower is sharper and bigger.
+                               zoom (default 1): crop the picture closer around the face first.
+                               The model works on a grid 32 times coarser than the picture, so
+                               a face 135 pixels tall is four cells; closer in, it gets more.
+                               focus_x / focus_y: where the face is, as shares of the picture.
     binary                     speech, 16-bit mono PCM at ``sr``; send a whole utterance at once
     {"type": "clock", "played": 12.3}    seconds the page has played, a few times a second
     {"type": "flush"}          drop speech that has not been drawn yet
@@ -35,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import os
@@ -47,6 +52,7 @@ from pathlib import Path
 
 import av
 import numpy as np
+from PIL import Image
 import torch
 import torchaudio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -102,6 +108,19 @@ async def health() -> dict:
         "live_prompts": engine is not None and engine.text_encoder is not None,
         "last": state["last"],
     }
+
+
+def framed(data: bytes, width: int, height: int, zoom: float, focus_x: float, focus_y: float) -> Image.Image:
+    """The part of the picture to start from: the output's shape, ``zoom`` times closer, kept on the face."""
+    picture = Image.open(io.BytesIO(data)).convert("RGB")
+    full_w, full_h = picture.size
+    aspect = width / height
+    box_w = min(full_w, full_h * aspect) / max(1.0, zoom)
+    box_h = box_w / aspect
+    left = min(max(0.0, focus_x * full_w - box_w / 2), full_w - box_w)
+    # the face a little above the middle of what is kept, as in the uncropped scenes
+    top = min(max(0.0, focus_y * full_h - 0.38 * box_h), full_h - box_h)
+    return picture.crop((round(left), round(top), round(left + box_w), round(top + box_h)))
 
 
 class Encoder:
@@ -161,9 +180,14 @@ class Stream:
         self.current_prompt = self.idle_prompt
         self.image_path: str | None = None
         if start.get("image_b64"):
+            zoom = max(1.0, min(3.0, float(start.get("zoom") or 1.0)))
+            self.options["zoom"] = zoom
             handle = tempfile.NamedTemporaryFile(prefix="avatar-", suffix=".png", delete=False)
-            handle.write(base64.b64decode(start["image_b64"]))
             handle.close()
+            framed(
+                base64.b64decode(start["image_b64"]), self.width, self.height, zoom,
+                float(start.get("focus_x") or 0.5), float(start.get("focus_y") or 0.33),
+            ).save(handle.name)
             self.image_path = handle.name
         self.session = Session(
             engine, image_path=self.image_path, prompt=self.idle_prompt,
